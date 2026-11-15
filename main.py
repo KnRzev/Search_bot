@@ -6,8 +6,7 @@ if not BOT_TOKEN:
     raise RuntimeError("Не удалось найти BOT_TOKEN")
 
 
-import asyncio
-import aiogram
+import asyncio, aiogram, aiohttp
 from aiogram import F
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message
@@ -28,15 +27,6 @@ back_to_menu = InlineKeyboardMarkup(
         ]
 )
 
-without_source = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Поиск везде", callback_data="all"),
-            InlineKeyboardButton(text="Поиск на Wikipedia", callback_data="wiki")],
-            [InlineKeyboardButton(text="Поиск на Github", callback_data="git"),
-            InlineKeyboardButton(text="Поиск на Stackoverflow", callback_data="stack")],
-            [InlineKeyboardButton(text="Главное меню", callback_data="menu")]
-        ]
-)
 
 
 async def start_handler(message: Message, state: FSMContext):
@@ -76,7 +66,7 @@ async def answer_before_search(event: CallbackQuery | Message, state: FSMContext
         if source is None:
             await event.delete()
             await event.bot.delete_message(chat_id=event.chat.id, message_id=event.message_id - 1)
-            await event.answer("Сначала выберите сайт для поиска или вернитесь в главное меню:", reply_markup=without_source)
+            await event.answer("Сначала выберите сайт для поиска", reply_markup=menu_keyboard)
             return
 
         search_func = {
@@ -91,8 +81,15 @@ async def answer_before_search(event: CallbackQuery | Message, state: FSMContext
         await state.update_data(source="in_search")
         await func(event, query, state)
 
-        #print("Выбранный сайт:", source)
-        #print("Введённый текст:", event.text)
+        if event.from_user is not None:
+            username = event.from_user.username
+            if not username:
+                print("ID пользователя:", event.from_user.id)
+            else:
+                print("Пользователь:", f"@{username}")
+
+        print("Выбранный сайт:", source)
+        print("Введённый текст:", event.text)
 
 
 
@@ -108,13 +105,124 @@ async def wiki_search(event, query: str, state: FSMContext):
     await event.delete()
     await event.bot.delete_message(chat_id=event.chat.id, message_id=event.message_id - 1)
 
-    await event.answer(f"Ищу статьи на Wikipedia по теме: {query}")
+    params = {
+        "action": "query",
+        "list": "search",
+        "srsearch": query,
+        "srlimit": 3,
+        "format": "json",
+    }
+
+    headers = {
+        "User-Agent": "StudySearchBot (https://github.com/KnRzev/Search_bot) ",
+    }
+
+    timeout = aiohttp.ClientTimeout(total=15)
+
+    async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+        async with session.get("https://ru.wikipedia.org/w/api.php", params=params) as response:
+            response.raise_for_status()
+            data = await response.json()
+
+    if "error" in data:
+        print("Ошибка API Wikipedia:", data["error"])
+
+        await event.answer(
+            "Не удалось выполнить поиск на Wikipedia. "
+            "Попробуйте позже или вернитесь в главное меню.",
+            reply_markup=back_to_menu,
+        )
+        await state.clear()
+        return
+
+    articles = data["query"]["search"]
+
+    if not articles:
+        print("Ничего не найдено.")
+        await event.answer("По вашей теме ничего не найдено. Попробуйте задать другую тему "
+                           "или вы можете вернуться в главное меню.", reply_markup=back_to_menu)
+        await state.update_data(source="wiki")
+
+        return
+
+    for number, article in enumerate(articles, start=1):
+
+        if number == 1:
+            await event.answer(f"По вашем запросу на тему '{query}' найдено:\n")
+
+        url = f"https://ru.wikipedia.org/?curid={article['pageid']}"
+
+        await event.answer(f"{number}. Название статьи: {article["title"]}\n"
+                           f"Ссылка на статью: {url}")
+
+    await event.answer("Напишите следующую тему для поиска "
+                        "или измените сайт для поиска через главное меню.", reply_markup=back_to_menu)
+
+    return
+
 
 async def git_search(event, query: str, state: FSMContext):
     await event.delete()
     await event.bot.delete_message(chat_id=event.chat.id, message_id=event.message_id - 1)
 
-    await event.answer(f"Ищу репозитории и проекты на Github по теме: {query}")
+    params = {
+        "q": query,
+        "per_page": 3,
+    }
+
+    headers = {
+        "User-Agent": "StudySearchBot (https://github.com/KnRzev/Search_bot)",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2026-03-10",
+    }
+
+    timeout = aiohttp.ClientTimeout(total=15)
+
+    async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+        async with session.get("https://api.github.com/search/repositories", params=params) as response:
+            status = response.status
+            data = await response.json()
+
+    if status >= 400:
+        print("Ошибка API GitHub:", data)
+
+        await event.answer(
+            "Не удалось выполнить поиск на GitHub. "
+            "Попробуйте позже или вернитесь в главное меню.",
+            reply_markup=back_to_menu,
+        )
+        await state.clear()
+        return
+
+    repositories = data["items"]
+
+    if not repositories:
+        print("Ничего не найдено.")
+
+        await event.answer(
+            "По вашей теме ничего не найдено. Попробуйте задать другую тему "
+            "или вы можете вернуться в главное меню.", reply_markup=back_to_menu)
+        await state.update_data(source="git")
+        return
+
+    for number, repository in enumerate(repositories, start=1):
+        if number == 1:
+            await event.answer(f"По вашему запросу на тему '{query}' найдено:\n")
+
+        url = repository["html_url"]
+
+        await event.answer(
+            f"{number}. Название проекта: {repository['full_name']}\n"
+            f"Ссылка на проект: {url}"
+        )
+
+    await event.answer(
+        "Напишите следующую тему для поиска "
+        "или измените сайт для поиска через главное меню.",
+        reply_markup=back_to_menu,
+    )
+
+    return
 
 
 async def stack_search(event, query: str, state: FSMContext):
